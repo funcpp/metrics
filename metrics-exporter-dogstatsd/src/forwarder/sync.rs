@@ -16,14 +16,52 @@ use crate::{
     writer::PayloadWriter,
 };
 
-/// Returns the local address to bind to when connecting to the given remote addresses.
+/// Returns the remote addresses to try, in the order they should be attempted.
 ///
-/// A socket can only connect within its own address family, so this follows the first address that will be tried.
-fn udp_bind_addr(addrs: &[SocketAddr]) -> SocketAddr {
-    match addrs.first() {
-        Some(SocketAddr::V6(_)) => (Ipv6Addr::UNSPECIFIED, 0).into(),
-        _ => (Ipv4Addr::UNSPECIFIED, 0).into(),
+/// IPv4 addresses are tried first: the Datadog Agent will preferentially bind to IPv4 addresses based on its
+/// `bind_host` configuration, and only in very specific cases bind _only_ to an IPv6 address. As such, when we observe
+/// both IPv4 and IPv6 addresses in our address list, we prefer IPv4 since there's a greater chance of the Agent
+/// actually listening on the IPv4 addresses than the IPv6 addresses.
+fn remote_addrs_in_preferred_order(addrs: &[SocketAddr]) -> impl Iterator<Item = &SocketAddr> {
+    addrs.iter().filter(|addr| addr.is_ipv4()).chain(addrs.iter().filter(|addr| addr.is_ipv6()))
+}
+
+/// Returns the local address to bind to in order to connect to the given remote address.
+///
+/// A socket can only connect within its own address family.
+fn udp_bind_addr(addr: &SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
     }
+}
+
+/// Connects a UDP socket to the first reachable address in `addrs`.
+///
+/// Each candidate gets a socket bound in its own address family, so a mixed-family list falls through to the next
+/// candidate instead of failing outright. As with `UdpSocket::connect`, the last error is returned if every candidate
+/// fails.
+fn connect_udp(addrs: &[SocketAddr]) -> io::Result<UdpSocket> {
+    let mut last_err = None;
+
+    let addresses = remote_addrs_in_preferred_order(addrs);
+    for addr in addresses {
+        let bind_addr = udp_bind_addr(addr);
+        match UdpSocket::bind(bind_addr).and_then(|socket| {
+            socket.connect(addr)?;
+            Ok(socket)
+        }) {
+            Ok(socket) => {
+                debug!(remote_addr = %addr, "Connected to remote address.");
+                return Ok(socket);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "could not resolve to any addresses")
+    }))
 }
 
 enum Client {
@@ -39,11 +77,11 @@ enum Client {
 impl Client {
     fn from_forwarder_config(config: &ForwarderConfiguration) -> io::Result<Self> {
         match &config.remote_addr {
-            RemoteAddr::Udp(addrs) => UdpSocket::bind(udp_bind_addr(addrs)).and_then(|socket| {
-                socket.connect(&addrs[..])?;
+            RemoteAddr::Udp(addrs) => {
+                let socket = connect_udp(addrs)?;
                 socket.set_write_timeout(Some(config.write_timeout))?;
                 Ok(Client::Udp(socket))
-            }),
+            }
 
             #[cfg(unix)]
             RemoteAddr::Unixgram(path) => UnixDatagram::unbound().and_then(|socket| {
@@ -225,16 +263,35 @@ impl Forwarder {
 mod tests {
     use super::*;
 
+    fn v4(last: u8) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::new(127, 0, 0, last), 8125))
+    }
+
+    fn v6(last: u16) -> SocketAddr {
+        SocketAddr::from((Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, last), 8125))
+    }
+
+    fn ordered(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+        remote_addrs_in_preferred_order(addrs).copied().collect()
+    }
+
     #[test]
     fn udp_bind_addr_matches_remote_address_family() {
-        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 8125));
-        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 8125));
-        let v4_bind = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
-        let v6_bind = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
+        assert_eq!(udp_bind_addr(&v4(1)), SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
+        assert_eq!(udp_bind_addr(&v6(1)), SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)));
+    }
 
-        assert_eq!(udp_bind_addr(&[v4]), v4_bind);
-        assert_eq!(udp_bind_addr(&[v6]), v6_bind);
-        assert_eq!(udp_bind_addr(&[v6, v4]), v6_bind);
-        assert_eq!(udp_bind_addr(&[v4, v6]), v4_bind);
+    #[test]
+    fn connect_order_prefers_ipv4() {
+        assert_eq!(ordered(&[]), vec![]);
+        assert_eq!(ordered(&[v4(1)]), vec![v4(1)]);
+        assert_eq!(ordered(&[v6(1)]), vec![v6(1)]);
+        assert_eq!(ordered(&[v6(1), v4(1)]), vec![v4(1), v6(1)]);
+        assert_eq!(ordered(&[v4(1), v6(1)]), vec![v4(1), v6(1)]);
+    }
+
+    #[test]
+    fn connect_order_preserves_resolver_order_within_family() {
+        assert_eq!(ordered(&[v6(1), v4(1), v6(2), v4(2)]), vec![v4(1), v4(2), v6(1), v6(2)]);
     }
 }
